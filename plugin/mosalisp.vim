@@ -1,7 +1,7 @@
 " mosalisp.vim - lisp interpreter
 " Maintainer:   Yukihiro Nakadaira <yukihiro.nakadaira@gmail.com>
 " License:      This file is placed in the public domain.
-" Last Change:  2007-08-09
+" Last Change:  2007-08-12
 "
 " Usage:
 "   :source mosalisp.vim
@@ -10,23 +10,19 @@
 " Example:
 "   :call mosalisp.repl()
 "   > (define func (lambda () (display "hello, world")))
-"   => ()
 "   > (func)
 "   hello, world
-"   => ()
 "   > (:call "append" 0 '("line1" "line2"))
 "   => 0
 "   > (:execute "new file.txt")
 "   "file.txt" [New File]
-"   => ()
 "   > (let loop ((i 0))
-"   >   (when (< i 3)
-"   >     (printf "%d" i)
-"   >     (loop (+ i 1))))
+"   >> (when (< i 3)
+"   >>> (printf "%d" i)
+"   >>> (loop (+ i 1))))
 "   0
 "   1
 "   2
-"   => ()
 "
 "   See mosalisp.init() function and trailing script for more
 "   information.
@@ -40,12 +36,21 @@ function s:lib.repl()
   let save_more = &more
   set nomore
   let self.inbuf = []
+  let self.read_nest = 1
   let self.getchar = self.getchar_input
-  let self.env = [self.top_env]
+  let self.scope = [self.top_env]
   let self.stack = [["op_loop", 1, self.NIL]]
   while self.stack[0][0] != "op_exit"
     let op = remove(self.stack, 0)
-    call self[op[0]](op)
+    try
+      call self[op[0]](op)
+    catch
+      echohl Error
+      echo "Exception from" v:throwpoint
+      echo v:exception
+      echohl None
+      break
+    endtry
   endwhile
   let &more = save_more
 endfunction
@@ -53,11 +58,19 @@ endfunction
 function s:lib.load_str(str, ...)
   let self.inbuf = split(a:str, '\zs')
   let self.getchar = self.getchar_str
-  let self.env = [self.top_env]
+  let self.scope = [self.top_env]
   let self.stack = [["op_loop", 0, self.NIL]]
   while self.stack[0][0] != "op_exit"
     let op = remove(self.stack, 0)
-    call self[op[0]](op)
+    try
+      call self[op[0]](op)
+    catch
+      echohl Error
+      echo "Exception from" v:throwpoint
+      echo v:exception
+      echohl None
+      break
+    endtry
   endwhile
   let res = self.stack[0][1]
   return get(a:000, 0, 0) ? res : self.to_vimobj(res)
@@ -68,11 +81,22 @@ function s:lib.load(fname, ...)
 endfunction
 
 function s:lib.dump_env()
-  for env in self.env
+  for env in self.scope
     for name in sort(keys(env))
       let item = env[name]
       echo printf("%s [%s]", name, item.type)
     endfor
+  endfor
+endfunction
+
+function s:lib.get_funcname(number)
+  for name in keys(self)
+    if type(self[name]) == type(function("tr"))
+      let s = string(self[name])
+      if s =~ printf("'%d'", a:number)
+        return name
+      endif
+    endif
   endfor
 endfunction
 
@@ -81,9 +105,12 @@ function s:lib.read()
   call self.skip_blank()
   let c = self.peekchar()
   if c == "eof"
-    return self.NIL
+    return self.Undefined
   elseif c == '('
-    return self.read_list()
+    let self.read_nest += 1
+    let res = self.read_list()
+    let self.read_nest -= 1
+    return res
   elseif c == '"'
     return self.read_string()
   elseif c =~ '\d' || c =~ '[-+]' && get(self.inbuf, 1, "") =~ '\d'
@@ -104,7 +131,7 @@ function s:lib.read_list()
   call self.getchar()
   call self.skip_blank()
   while self.peekchar() != ')'
-    if self.peekchar() == "elf"
+    if self.peekchar() == "eof"
       throw "eof"
     elseif self.peekchar() == "."
       call self.getchar()
@@ -235,13 +262,14 @@ endfunction
 
 function s:lib.getchar_input()
   if self.inbuf == []
+    let prefix = repeat(">", self.read_nest) . " "
     try
-      let str = input("> ")
+      let str = input(prefix)
     catch /Vim:Interrupt/
       let self.inbuf = ["eof"]
       return "eof"
     endtry
-    echon printf("\r> %s", str)
+    echon printf("\r%s%s", prefix, str)
     let self.inbuf = split(str, '\zs') + ["\n"]
     return self.getchar_input()
   endif
@@ -302,7 +330,7 @@ function s:lib.mk_closure(code)
   return {
         \ "type": "closure",
         \ "val": "f_closure",
-        \ "env": copy(self.env),
+        \ "scope": copy(self.scope),
         \ "code": copy(a:code)
         \ }
 endfunction
@@ -310,9 +338,18 @@ endfunction
 function s:lib.mk_macro(code)
   return {
         \ "type": "macro",
-        \ "val": "s_macro_eval",
-        \ "env": copy(self.env),
+        \ "val": "f_closure",
+        \ "scope": copy(self.scope),
         \ "code": copy(a:code)
+        \ }
+endfunction
+
+function s:lib.mk_continuation()
+  return {
+        \ "type": "continuation",
+        \ "val": "f_continue",
+        \ "scope": copy(self.scope),
+        \ "stack": map(copy(self.stack), 'copy(v:val)')
         \ }
 endfunction
 
@@ -337,15 +374,15 @@ endfunction
 function s:lib.op_eval(op)
   let code = a:op[1]
   if code.type == "symbol"
-    for env in self.env
+    for env in self.scope
       if has_key(env, code.val)
         call add(self.stack[0], env[code.val])
         return
       endif
     endfor
-    throw printf("Unbounded Variable: %s", code.val)
+    call self.error(printf("Unbounded Variable: %s", code.val))
   elseif code.type == "pair"
-    call insert(self.stack, ["op_call", code.cdr])
+    call insert(self.stack, ["op_call", code, code.cdr])
     call insert(self.stack, ["op_eval", code.car])
   else
     call add(self.stack[0], code)
@@ -353,7 +390,10 @@ function s:lib.op_eval(op)
 endfunction
 
 function s:lib.op_print(op)
-  echo "=>" self.to_str(a:op[1])
+  let value = a:op[1]
+  if value.type != "undefined"
+    echo "=>" self.to_str(a:op[1])
+  endif
   call add(self.stack[0], a:op[1])
 endfunction
 
@@ -380,8 +420,12 @@ function s:lib.op_error(op)
 endfunction
 
 function s:lib.op_call(op)
-  let [code, func] = a:op[1:]
-  if func.type == "syntax" || func.type == "macro"
+  let [orig, code, func] = a:op[1:]
+  if func.type == "macro"
+    call insert(self.stack, ["op_eval"])
+    call insert(self.stack, ["op_macro_replace", orig])
+    call insert(self.stack, ["op_apply", func, code])
+  elseif func.type == "syntax"
     call insert(self.stack, ["op_apply", func, code])
   else
     if code == self.NIL
@@ -410,26 +454,41 @@ function s:lib.op_apply(op)
   call self[func.val](func, args)
 endfunction
 
+function s:lib.op_macro_replace(op)
+  let [orig, code] = a:op[1:]
+  for key in keys(orig)
+    unlet orig[key]
+  endfor
+  call extend(orig, code)
+  call add(self.stack[0], code)
+endfunction
+
+function s:lib.op_macro_eval(op)
+  let lst = a:op[1]
+  let [macro, args] = [lst.car, lst.cdr]
+  call self[macro.val](macro, args)
+endfunction
+
 function s:lib.op_return(op)
-  let self.env = a:op[1]
+  let self.scope = a:op[1]
   call add(self.stack[0], a:op[2])
 endfunction
 
 function s:lib.op_define(op)
   call self.define(a:op[1].val, a:op[2])
-  call add(self.stack[0], self.NIL)
+  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.op_set(op)
   let [name, value] = a:op[1:]
-  for env in self.env
+  for env in self.scope
     if has_key(env, name.val)
       let env[name.val] = value
-      call add(self.stack[0], self.NIL)
+      call add(self.stack[0], self.Undefined)
       return
     endif
   endfor
-  throw printf("Unbounded Variable: %s", name.val)
+  call self.error(printf("Unbounded Variable: %s", name.val))
 endfunction
 
 function s:lib.op_if(op)
@@ -443,7 +502,7 @@ function s:lib.op_cond(op)
     call self.begin(expr)
   else
     if code == self.NIL
-      call add(self.stack[0], self.NIL)
+      call add(self.stack[0], self.Undefined)
     elseif code.car.car.type == "symbol" && code.car.car.val == "else"
       call insert(self.stack, ["op_cond", self.NIL, code.car.cdr, self.True])
     else
@@ -477,8 +536,13 @@ function s:lib.op_and(op)
   endif
 endfunction
 
+function s:lib.error(msg)
+  let args = self.mk_list([self.mk_string(a:msg)])
+  call insert(self.stack, ["op_error", args])
+endfunction
+
 function s:lib.define(name, obj)
-  let self.env[0][a:name] = a:obj
+  let self.scope[0][a:name] = a:obj
 endfunction
 
 function s:lib.begin(code)
@@ -501,22 +565,6 @@ function s:lib.s_quote(this, code)
   call add(self.stack[0], a:code.car)
 endfunction
 
-function s:lib.s_macro_eval(this, code)
-  let [this, code] = [a:this, a:code]
-  call insert(self.stack, ["op_eval"])
-  call insert(self.stack, ["op_return", self.env])
-  let self.env = [{}] + this.env
-  let p = this.code.car
-  while p.type == "pair"
-    call self.define(p.car.val, code.car)
-    let [p, code] = [p.cdr, code.cdr]
-  endwhile
-  if p != self.NIL
-    call self.define(p.val, code)
-  endif
-  call self.begin(this.code.cdr)
-endfunction
-
 function s:lib.s_define(this, code)
   let code = a:code
   if code.car.type == "pair"
@@ -535,7 +583,7 @@ endfunction
 
 function s:lib.s_if(this, code)
   call insert(self.stack, ["op_if", a:code.cdr.car,
-        \ get(a:code.cdr.cdr, "car", self.NIL)])
+        \ get(a:code.cdr.cdr, "car", self.Undefined)])
   call insert(self.stack, ["op_eval", a:code.car])
 endfunction
 
@@ -545,7 +593,7 @@ endfunction
 
 function s:lib.s_begin(this, code)
   if a:code == self.NIL
-    call add(self.stack[0], self.NIL)
+    call add(self.stack[0], self.Undefined)
   else
     call self.begin(a:code)
   endif
@@ -565,6 +613,7 @@ function s:lib.f_error(this, args)
 endfunction
 
 function s:lib.f_exit(this, args)
+  " (exit [exitcode])
   if a:args == self.NIL
     call insert(self.stack, ["op_exit", self.NIL])
   else
@@ -573,21 +622,31 @@ function s:lib.f_exit(this, args)
 endfunction
 
 function s:lib.f_load(this, args)
+  " (load filename)
   let save = [self.inbuf, self.getchar, self.stack]
   call add(self.stack[0], self.load(self.to_vimobj(a:args.car), 1))
   let [self.inbuf, self.getchar, self.stack] = save
 endfunction
 
 function s:lib.f_eval(this, args)
+  " (eval '(proc a b c))
   call insert(self.stack, ["op_eval", a:args.car])
+endfunction
+
+function s:lib.f_macro_eval(this, args)
+  " (macro-eval '(macro a b c))
+  let code = a:args.car
+  call insert(self.stack, ["op_macro_eval"])
+  call insert(self.stack, ["op_args", code.cdr, self.NIL])
+  call insert(self.stack, ["op_eval", code.car])
 endfunction
 
 function s:lib.f_closure(this, args)
   let [this, args] = [a:this, a:args]
   if self.stack[0][0] != "op_return"
-    call insert(self.stack, ["op_return", self.env])
+    call insert(self.stack, ["op_return", self.scope])
   endif
-  let self.env = [{}] + this.env
+  let self.scope = [{}] + this.scope
   let p = this.code.car
   while p.type == "pair"
     call self.define(p.car.val, args.car)
@@ -600,12 +659,7 @@ function s:lib.f_closure(this, args)
 endfunction
 
 function s:lib.f_call_cc(this, args)
-  let cont = {
-        \ "type": "continuation",
-        \ "val": "f_continue",
-        \ "env": copy(self.env),
-        \ "stack": map(copy(self.stack), 'copy(v:val)')
-        \ }
+  let cont = self.mk_continuation()
   call insert(self.stack, ["op_apply", a:args.car, self.cons(cont, self.NIL)])
 endfunction
 
@@ -623,17 +677,17 @@ endfunction
 
 function s:lib.f_set_car(this, args)
   let a:args.car.car = a:args.cdr.car
-  call add(self.stack[0], self.NIL)
+  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.f_set_cdr(this, args)
   let a:args.car.cdr = a:args.cdr.car
-  call add(self.stack[0], self.NIL)
+  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.f_continue(this, args)
   let self.stack = map(copy(a:this.stack), 'copy(v:val)')
-  let self.env = copy(a:this.env)
+  let self.scope = copy(a:this.scope)
   call add(self.stack[0], (a:args == self.NIL) ? self.NIL : a:args.car)
 endfunction
 
@@ -712,7 +766,7 @@ function s:lib.f_printf(this, args)
   else
     echo call("printf", args)
   endif
-  call add(self.stack[0], self.NIL)
+  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.f_type(this, args)
@@ -729,14 +783,14 @@ function s:lib.f_vim_execute(this, args)
   " (:execute expr)
   let [expr] = self.to_vimobj(a:args)
   execute expr
-  call add(self.stack[0], self.NIL)
+  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.f_vim_let(this, args)
   " (:let name value)
   let [name, value] = self.to_vimobj(a:args)
   execute printf("let %s = value", name)
-  call add(self.stack[0], self.NIL)
+  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.f_vim_function(this, args)
@@ -757,11 +811,12 @@ function s:lib.f_hash_table_set(this, args)
   " (hash-table-set! hash key value)
   let [hash, key, value] = self.to_vimobj(a:args)
   let hash[key] = value
-  call add(self.stack[0], self.NIL)
+  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.to_str(obj)
-  if a:obj.type == "NIL"             | return "()"
+  if a:obj.type == "undefined"       | return "#<undefined>"
+  elseif a:obj.type == "NIL"         | return "()"
   elseif a:obj.type == "boolean"     | return (a:obj.val ? "#t" : "#f")
   elseif a:obj.type == "number"      | return string(a:obj.val)
   elseif a:obj.type == "string"      | return string(a:obj.val)
@@ -777,7 +832,8 @@ function s:lib.to_str(obj)
 endfunction
 
 function s:lib.to_vimobj(obj)
-  if a:obj.type == "NIL"             | return a:obj.val
+  if a:obj.type == "undefined"       | return a:obj.val
+  elseif a:obj.type == "NIL"         | return a:obj.val
   elseif a:obj.type == "boolean"     | return a:obj.val
   elseif a:obj.type == "number"      | return a:obj.val
   elseif a:obj.type == "string"      | return a:obj.val
@@ -790,6 +846,7 @@ function s:lib.to_vimobj(obj)
       call add(res, self.to_vimobj(p.car))
       let p = p.cdr
     endwhile
+    " TODO: How to tell whether object is pair or list?
     if p != self.NIL
       call add(res, self.to_vimobj(p))
     endif
@@ -816,16 +873,23 @@ endfunction
 
 function s:lib.init()
   let self.inbuf = []
+  let self.read_nest = 1
   let self.symbol_table = {}
   let self.top_env = {}
-  let self.env = [self.top_env]
-  let self.stack = []
+
+  " constant
+  let self.Undefined = {"type":"undefined", "val":["#<undefined>"]}
   let self.NIL = {"type":"NIL", "val":[]}
   let self.False = {"type":"boolean", "val":0}
   let self.True  = {"type":"boolean", "val":1}
+  lockvar self.Undefined
   lockvar self.NIL
   lockvar self.False
   lockvar self.True
+
+  " register
+  let self.scope = [self.top_env]
+  let self.stack = []
 
   call self.define("lambda", {"type":"syntax", "val":"s_lambda"})
   call self.define("macro" , {"type":"syntax", "val":"s_macro"})
@@ -842,6 +906,7 @@ function s:lib.init()
   call self.define("exit"  , {"type":"procedure", "val":"f_exit"})
   call self.define("load"  , {"type":"procedure", "val":"f_load"})
   call self.define("eval"  , {"type":"procedure", "val":"f_eval"})
+  call self.define("macro-eval", {"type":"procedure", "val":"f_macro_eval"})
   call self.define("call-with-current-continuation", {"type":"procedure", "val":"f_call_cc"})
   call self.define("cons"  , {"type":"procedure", "val":"f_cons"})
   call self.define("car"   , {"type":"procedure", "val":"f_car"})
@@ -1037,7 +1102,8 @@ mzscheme <<EOF
 
 (define (map proc list)
     (if (pair? list)
-        (cons (proc (car list)) (map proc (cdr list)))))
+        (cons (proc (car list)) (map proc (cdr list)))
+        '()))
 
 (define (for-each proc list)
     (if (pair? list)
@@ -1184,6 +1250,19 @@ mzscheme <<EOF
   (if (<= n 1)
       n
       (+ (fib (- n 1)) (fib (- n 2)))))
+
+(define (str->hex str)
+  (define format
+    (macro args
+      `(:call "printf" ,@args)))
+  (define (str-len str) (:call "strlen" str))
+  (define (str-ref str n) (:call "strpart" str n 1))
+  (define (str-ref-hex str n)
+    (format "%02X" (:call "char2nr" (str-ref str n))))
+  (let loop ((i 0) (res '()))
+    (if (>= i (str-len str))
+      (:call "join" (reverse res) "")
+      (loop (+ i 1) (cons (str-ref-hex str i) res)))))
 
 EOF
 
