@@ -1,7 +1,7 @@
 " mosalisp.vim - lisp interpreter
 " Maintainer:   Yukihiro Nakadaira <yukihiro.nakadaira@gmail.com>
 " License:      This file is placed in the public domain.
-" Last Change:  2007-08-12
+" Last Change:  2007-08-14
 "
 " Usage:
 "   :source mosalisp.vim
@@ -46,7 +46,7 @@ function s:lib.repl()
       call self[op[0]](op)
     catch
       echohl Error
-      echo "Exception from" v:throwpoint
+      echo "Exception from" self.get_throwpoint()
       echo v:exception
       echohl None
       break
@@ -66,7 +66,7 @@ function s:lib.load_str(str, ...)
       call self[op[0]](op)
     catch
       echohl Error
-      echo "Exception from" v:throwpoint
+      echo "Exception from" self.get_throwpoint()
       echo v:exception
       echohl None
       break
@@ -98,6 +98,11 @@ function s:lib.get_funcname(number)
       endif
     endif
   endfor
+  return a:number
+endfunction
+
+function s:lib.get_throwpoint()
+  return substitute(v:throwpoint, '\d\+\ze\.\.\|\.\.\zs\d\+', '\=self.get_funcname(submatch(0))', 'g')
 endfunction
 
 " {{{ read
@@ -344,6 +349,17 @@ function s:lib.mk_macro(code)
         \ }
 endfunction
 
+function s:lib.mk_procedure(code)
+  let expr = self.to_vimobj(a:code.cdr.car)
+  return {
+        \ "type": "procedure",
+        \ "val": "f_procedure",
+        \ "scope": copy(self.scope),
+        \ "code": copy(a:code),
+        \ "expr": expr
+        \ }
+endfunction
+
 function s:lib.mk_continuation()
   return {
         \ "type": "continuation",
@@ -456,14 +472,11 @@ endfunction
 
 function s:lib.op_macro_replace(op)
   let [orig, code] = a:op[1:]
-  for key in keys(orig)
-    unlet orig[key]
-  endfor
-  call extend(orig, code)
+  call self.obj_replace(orig, code)
   call add(self.stack[0], code)
 endfunction
 
-function s:lib.op_macro_eval(op)
+function s:lib.op_macro_apply(op)
   let lst = a:op[1]
   let [macro, args] = [lst.car, lst.cdr]
   call self[macro.val](macro, args)
@@ -546,9 +559,11 @@ function s:lib.define(name, obj)
 endfunction
 
 function s:lib.begin(code)
-  let p = self.reverse(a:code)
+  let i = 0
+  let p = a:code
   while p.type == "pair"
-    call insert(self.stack, ["op_eval", p.car])
+    call insert(self.stack, ["op_eval", p.car], i)
+    let i += 1
     let p = p.cdr
   endwhile
 endfunction
@@ -559,6 +574,11 @@ endfunction
 
 function s:lib.s_macro(this, code)
   call add(self.stack[0], self.mk_macro(a:code))
+endfunction
+
+function s:lib.s_procedure(this, code)
+  " (%proc (args) expr)
+  call add(self.stack[0], self.mk_procedure(a:code))
 endfunction
 
 function s:lib.s_quote(this, code)
@@ -607,46 +627,14 @@ function s:lib.s_and(this, code)
   call insert(self.stack, ["op_and", a:code, self.True])
 endfunction
 
-function s:lib.f_error(this, args)
-  " (error "message" obj ...)
-  call insert(self.stack, ["op_error", a:args])
-endfunction
-
-function s:lib.f_exit(this, args)
-  " (exit [exitcode])
-  if a:args == self.NIL
-    call insert(self.stack, ["op_exit", self.NIL])
-  else
-    call insert(self.stack, ["op_exit", a:args.car])
-  endif
-endfunction
-
-function s:lib.f_load(this, args)
-  " (load filename)
-  let save = [self.inbuf, self.getchar, self.stack]
-  call add(self.stack[0], self.load(self.to_vimobj(a:args.car), 1))
-  let [self.inbuf, self.getchar, self.stack] = save
-endfunction
-
-function s:lib.f_eval(this, args)
-  " (eval '(proc a b c))
-  call insert(self.stack, ["op_eval", a:args.car])
-endfunction
-
-function s:lib.f_macro_eval(this, args)
-  " (macro-eval '(macro a b c))
-  let code = a:args.car
-  call insert(self.stack, ["op_macro_eval"])
-  call insert(self.stack, ["op_args", code.cdr, self.NIL])
-  call insert(self.stack, ["op_eval", code.car])
-endfunction
-
 function s:lib.f_closure(this, args)
   let [this, args] = [a:this, a:args]
   if self.stack[0][0] != "op_return"
     call insert(self.stack, ["op_return", self.scope])
   endif
   let self.scope = [{}] + this.scope
+
+  " expand arguments
   let p = this.code.car
   while p.type == "pair"
     call self.define(p.car.val, args.car)
@@ -655,34 +643,8 @@ function s:lib.f_closure(this, args)
   if p != self.NIL
     call self.define(p.val, args)
   endif
+
   call self.begin(this.code.cdr)
-endfunction
-
-function s:lib.f_call_cc(this, args)
-  let cont = self.mk_continuation()
-  call insert(self.stack, ["op_apply", a:args.car, self.cons(cont, self.NIL)])
-endfunction
-
-function s:lib.f_cons(this, args)
-  call add(self.stack[0], self.cons(a:args.car, a:args.cdr.car))
-endfunction
-
-function s:lib.f_car(this, args)
-  call add(self.stack[0], a:args.car.car)
-endfunction
-
-function s:lib.f_cdr(this, args)
-  call add(self.stack[0], a:args.car.cdr)
-endfunction
-
-function s:lib.f_set_car(this, args)
-  let a:args.car.car = a:args.cdr.car
-  call add(self.stack[0], self.Undefined)
-endfunction
-
-function s:lib.f_set_cdr(this, args)
-  let a:args.car.cdr = a:args.cdr.car
-  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.f_continue(this, args)
@@ -691,106 +653,26 @@ function s:lib.f_continue(this, args)
   call add(self.stack[0], (a:args == self.NIL) ? self.NIL : a:args.car)
 endfunction
 
-function s:lib.f_not(this, args)
-  if a:args.car != self.False
-    call add(self.stack[0], self.False)
-  else
-    call add(self.stack[0], self.True)
+function s:lib.f_procedure(this, args)
+  let [_this, _args] = [a:this, a:args]
+  let _expr = _this.expr
+
+  " expand arguments
+  let _p = _this.code.car
+  let _a = _args
+  while _p.type == "pair"
+    execute printf("let %s = _a.car", _p.car.val)
+    let _p = _p.cdr
+    let _a = _a.cdr
+  endwhile
+  if _p != self.NIL
+    execute printf("let %s = _a", _p.val)
   endif
-endfunction
 
-function s:lib.f_cmp_T(this, args)
-  let cmp = printf("let b = (lhs %s rhs)", a:this.op)
-  let lhs = self.to_vimobj(a:args.car)
-  let p = a:args.cdr
-  while p.type == "pair"
-    let rhs = self.to_vimobj(p.car)
-    execute cmp
-    if !b
-      call add(self.stack[0], self.False)
-      return
-    endif
-    let p = p.cdr
-    let lhs = rhs
-  endwhile
-  call add(self.stack[0], self.True)
-endfunction
-
-function s:lib.f_cmp_ins_T(this, args)
-  let cmp = printf("let b = (lhs %s rhs)", a:this.op)
-  let lhs = a:args.car
-  let p = a:args.cdr
-  while p.type == "pair"
-    let rhs = p.car
-    execute cmp
-    if !b
-      call add(self.stack[0], self.False)
-      return
-    endif
-    let p = p.cdr
-    let lhs = rhs
-  endwhile
-  call add(self.stack[0], self.True)
-endfunction
-
-function s:lib.f_sum_T(this, args)
-  let cmd = printf("let sum = sum %s val", a:this.op)
-  if a:this.op == "-" && a:args.cdr == self.NIL
-    let [sum, p] = [-self.to_vimobj(a:args.car), a:args.cdr]
-  elseif a:this.op == "/" && a:args.cdr == self.NIL
-    let [sum, p] = [1, a:args]
-  else
-    let [sum, p] = [self.to_vimobj(a:args.car), a:args.cdr]
+  execute _expr
+  if exists("_res")
+    call add(self.stack[0], _res)
   endif
-  while p.type == "pair"
-    let val = self.to_vimobj(p.car)
-    execute cmd
-    let p = p.cdr
-  endwhile
-  call add(self.stack[0], self.mk_number(sum))
-endfunction
-
-function s:lib.f_printf(this, args)
-  let args = []
-  let p = a:args
-  while p.type == "pair"
-    if p.car.type == "string"
-      call add(args, p.car.val)
-    else
-      call add(args, self.to_str(p.car))
-    endif
-    let p = p.cdr
-  endwhile
-  if len(args) == 1
-    echo args[0]
-  else
-    echo call("printf", args)
-  endif
-  call add(self.stack[0], self.Undefined)
-endfunction
-
-function s:lib.f_type(this, args)
-  call add(self.stack[0], self.mk_string(a:args.car.type))
-endfunction
-
-function s:lib.f_vim_call(this, args)
-  " (:call func . args)
-  let [func; args] = self.to_vimobj(a:args)
-  call add(self.stack[0], self.to_lispobj(call(func, args)))
-endfunction
-
-function s:lib.f_vim_execute(this, args)
-  " (:execute expr)
-  let [expr] = self.to_vimobj(a:args)
-  execute expr
-  call add(self.stack[0], self.Undefined)
-endfunction
-
-function s:lib.f_vim_let(this, args)
-  " (:let name value)
-  let [name, value] = self.to_vimobj(a:args)
-  execute printf("let %s = value", name)
-  call add(self.stack[0], self.Undefined)
 endfunction
 
 function s:lib.f_vim_function(this, args)
@@ -800,20 +682,6 @@ function s:lib.f_vim_function(this, args)
   call add(self.stack[0], self.to_lispobj(res))
 endfunction
 
-function s:lib.f_hash_table_ref(this, args)
-  " (hash-table-ref hash key)
-  let [hash, key] = self.to_vimobj(a:args)
-  let value = hash[key]
-  call add(self.stack[0], self.to_lispobj(value))
-endfunction
-
-function s:lib.f_hash_table_set(this, args)
-  " (hash-table-set! hash key value)
-  let [hash, key, value] = self.to_vimobj(a:args)
-  let hash[key] = value
-  call add(self.stack[0], self.Undefined)
-endfunction
-
 function s:lib.to_str(obj)
   if a:obj.type == "undefined"       | return "#<undefined>"
   elseif a:obj.type == "NIL"         | return "()"
@@ -821,8 +689,8 @@ function s:lib.to_str(obj)
   elseif a:obj.type == "number"      | return string(a:obj.val)
   elseif a:obj.type == "string"      | return string(a:obj.val)
   elseif a:obj.type == "symbol"      | return a:obj.val
-  elseif a:obj.type == "hash"        | return string(a:obj.val)
-  elseif a:obj.type == "pair"        | return string(self.to_vimobj(a:obj))
+  elseif a:obj.type == "hash"        | return "#<hash>"
+  elseif a:obj.type == "pair"        | return self.to_str_pair(a:obj, [])
   elseif a:obj.type == "closure"     | return "#<closure>"
   elseif a:obj.type == "continuation"| return "#<continuation>"
   elseif a:obj.type == "procedure"   | return "#<procedure>"
@@ -839,18 +707,7 @@ function s:lib.to_vimobj(obj)
   elseif a:obj.type == "string"      | return a:obj.val
   elseif a:obj.type == "symbol"      | return a:obj.val
   elseif a:obj.type == "hash"        | return a:obj.val
-  elseif a:obj.type == "pair"
-    let res = []
-    let p = a:obj
-    while p.type == "pair"
-      call add(res, self.to_vimobj(p.car))
-      let p = p.cdr
-    endwhile
-    " TODO: How to tell whether object is pair or list?
-    if p != self.NIL
-      call add(res, self.to_vimobj(p))
-    endif
-    return res
+  elseif a:obj.type == "pair"        | return self.to_vimobj_pair(a:obj, [], [])
   elseif a:obj.type == "closure"     | return a:obj
   elseif a:obj.type == "continuation"| return a:obj
   elseif a:obj.type == "procedure"   | return a:obj
@@ -863,10 +720,108 @@ function s:lib.to_lispobj(obj)
   if type(a:obj) == type(0)          | return self.mk_number(a:obj)
   elseif type(a:obj) == type("")     | return self.mk_string(a:obj)
   elseif type(a:obj) == type({})     | return self.mk_hash(a:obj)
-  elseif type(a:obj) == type([])
-    return self.mk_list(map(copy(a:obj), 'self.to_lispobj(v:val)'))
+  elseif type(a:obj) == type([])     | return self.to_lispobj_pair(a:obj, [], [])
   elseif type(a:obj) == type(function("tr")) | return self.mk_vim_function(a:obj)
   endif
+endfunction
+
+function s:lib.to_str_pair(obj, nest)
+  if self.obj_index(a:nest, a:obj) != -1
+    let n = self.obj_index(a:nest, a:obj)
+    return printf("#%d(...)", n)
+  endif
+  let res = []
+  call add(a:nest, a:obj)
+  let p = a:obj
+  while p.type == "pair"
+    if p.car.type == "pair"
+      call add(res, self.to_str_pair(p.car, a:nest))
+    else
+      call add(res, self.to_str(p.car))
+    endif
+    let p = p.cdr
+    if self.obj_index(a:nest, p) != -1
+      break
+    endif
+  endwhile
+  if p != self.NIL
+    call add(res, ".")
+    if p.type == "pair"
+      call add(res, self.to_str_pair(p, a:nest))
+    else
+      call add(res, self.to_str(p))
+    endif
+  endif
+  return '(' . join(res) . ')'
+endfunction
+
+function s:lib.to_vimobj_pair(obj, nest, vimobj)
+  " TODO: How to tell whether object is pair or list?
+  if self.obj_index(a:nest, a:obj) != -1
+    let n = self.obj_index(a:nest, a:obj)
+    return a:vimobj[n]
+  endif
+  let res = []
+  call add(a:nest, a:obj)
+  call add(a:vimobj, res)
+  let p = a:obj
+  while p.type == "pair"
+    if p.car.type == "pair"
+      call add(res, self.to_vimobj_pair(p.car, a:nest, a:vimobj))
+    else
+      call add(res, self.to_vimobj(p.car))
+    endif
+    let p = p.cdr
+    if self.obj_index(a:nest, p) != -1
+      break
+    endif
+  endwhile
+  if p != self.NIL
+    if p.type == "pair"
+      call add(res, self.to_vimobj_pair(p, a:nest, a:vimobj))
+    else
+      call add(res, self.to_vimobj(p))
+    endif
+  endif
+  return res
+endfunction
+
+function s:lib.to_lispobj_pair(obj, nest, lispobj)
+  if self.obj_index(a:nest, a:obj) != -1
+    let n = self.obj_index(a:nest, a:obj)
+    return a:lispobj[n]
+  endif
+  let res = {}  " place holder
+  let r = self.NIL
+  call add(a:nest, a:obj)
+  call add(a:lispobj, res)
+  for p in a:obj
+    if type(p) == type([])
+      let r = self.cons(self.to_lispobj_pair(p, a:nest, a:lispobj), r)
+    else
+      let r = self.cons(self.to_lispobj(p), r)
+    endif
+    unlet p     " avoid "E706: Variable type mismatch for: p"
+  endfor
+  return self.obj_replace(res, self.reverse(r))
+endfunction
+
+function s:lib.obj_index(lst, obj)
+  let i = 0
+  for o in a:lst
+    if o is a:obj
+      return i
+    endif
+    let i += 1
+  endfor
+  return -1
+endfunction
+
+function s:lib.obj_replace(lhs, rhs)
+  for key in keys(a:lhs)
+    unlet a:lhs[key]
+  endfor
+  return extend(a:lhs, a:rhs)
 endfunction
 
 " }}}
@@ -901,63 +856,7 @@ function s:lib.init()
   call self.define("begin" , {"type":"syntax", "val":"s_begin"})
   call self.define("or"    , {"type":"syntax", "val":"s_or"})
   call self.define("and"   , {"type":"syntax", "val":"s_and"})
-
-  call self.define("error" , {"type":"procedure", "val":"f_error"})
-  call self.define("exit"  , {"type":"procedure", "val":"f_exit"})
-  call self.define("load"  , {"type":"procedure", "val":"f_load"})
-  call self.define("eval"  , {"type":"procedure", "val":"f_eval"})
-  call self.define("macro-eval", {"type":"procedure", "val":"f_macro_eval"})
-  call self.define("call-with-current-continuation", {"type":"procedure", "val":"f_call_cc"})
-  call self.define("cons"  , {"type":"procedure", "val":"f_cons"})
-  call self.define("car"   , {"type":"procedure", "val":"f_car"})
-  call self.define("cdr"   , {"type":"procedure", "val":"f_cdr"})
-  call self.define("set-car!", {"type":"procedure", "val":"f_set_car"})
-  call self.define("set-cdr!", {"type":"procedure", "val":"f_set_cdr"})
-  call self.define("not"   , {"type":"procedure", "val":"f_not"})
-  call self.define("="     , {"type":"procedure", "val":"f_cmp_T", "op":"=="})
-  call self.define("=="    , {"type":"procedure", "val":"f_cmp_T", "op":"=="})
-  call self.define("!="    , {"type":"procedure", "val":"f_cmp_T", "op":"!="})
-  call self.define(">"     , {"type":"procedure", "val":"f_cmp_T", "op":">"})
-  call self.define(">="    , {"type":"procedure", "val":"f_cmp_T", "op":">="})
-  call self.define("<"     , {"type":"procedure", "val":"f_cmp_T", "op":"<"})
-  call self.define("<="    , {"type":"procedure", "val":"f_cmp_T", "op":"<="})
-  call self.define("=~"    , {"type":"procedure", "val":"f_cmp_T", "op":"=~"})
-  call self.define("!~"    , {"type":"procedure", "val":"f_cmp_T", "op":"!~"})
-  call self.define("=#"    , {"type":"procedure", "val":"f_cmp_T", "op":"==#"})
-  call self.define("==#"   , {"type":"procedure", "val":"f_cmp_T", "op":"==#"})
-  call self.define("!=#"   , {"type":"procedure", "val":"f_cmp_T", "op":"!=#"})
-  call self.define(">#"    , {"type":"procedure", "val":"f_cmp_T", "op":">#"})
-  call self.define(">=#"   , {"type":"procedure", "val":"f_cmp_T", "op":">=#"})
-  call self.define("<#"    , {"type":"procedure", "val":"f_cmp_T", "op":"<#"})
-  call self.define("<=#"   , {"type":"procedure", "val":"f_cmp_T", "op":"<=#"})
-  call self.define("=~#"   , {"type":"procedure", "val":"f_cmp_T", "op":"=~#"})
-  call self.define("!~#"   , {"type":"procedure", "val":"f_cmp_T", "op":"!~#"})
-  call self.define("=?"    , {"type":"procedure", "val":"f_cmp_T", "op":"==?"})
-  call self.define("==?"   , {"type":"procedure", "val":"f_cmp_T", "op":"==?"})
-  call self.define("!=?"   , {"type":"procedure", "val":"f_cmp_T", "op":"!=?"})
-  call self.define(">?"    , {"type":"procedure", "val":"f_cmp_T", "op":">?"})
-  call self.define(">=?"   , {"type":"procedure", "val":"f_cmp_T", "op":">=?"})
-  call self.define("<?"    , {"type":"procedure", "val":"f_cmp_T", "op":"<?"})
-  call self.define("<=?"   , {"type":"procedure", "val":"f_cmp_T", "op":"<=?"})
-  call self.define("=~?"   , {"type":"procedure", "val":"f_cmp_T", "op":"=~?"})
-  call self.define("!~?"   , {"type":"procedure", "val":"f_cmp_T", "op":"!~?"})
-  call self.define("is"    , {"type":"procedure", "val":"f_cmp_ins_T", "op":"is"})
-  call self.define("isnot" , {"type":"procedure", "val":"f_cmp_ins_T", "op":"isnot"})
-  call self.define("+"     , {"type":"procedure", "val":"f_sum_T", "op":"+"})
-  call self.define("-"     , {"type":"procedure", "val":"f_sum_T", "op":"-"})
-  call self.define("*"     , {"type":"procedure", "val":"f_sum_T", "op":"*"})
-  call self.define("/"     , {"type":"procedure", "val":"f_sum_T", "op":"/"})
-  call self.define("%"     , {"type":"procedure", "val":"f_sum_T", "op":"%"})
-  call self.define("printf", {"type":"procedure", "val":"f_printf"})
-  call self.define("display", {"type":"procedure", "val":"f_printf"})
-
-  call self.define("%type" , {"type":"procedure", "val":"f_type"})
-  call self.define(":call" , {"type":"procedure", "val":"f_vim_call"})
-  call self.define(":execute", {"type":"procedure", "val":"f_vim_execute"})
-  call self.define(":let", {"type":"procedure", "val":"f_vim_let"})
-
-  call self.define("hash-table-ref", {"type":"procedure", "val":"f_hash_table_ref"})
-  call self.define("hash-table-set!", {"type":"procedure", "val":"f_hash_table_set"})
+  call self.define("%proc" , {"type":"syntax", "val":"s_procedure"})
 
   " load init script
   echo "loading init script ..."
@@ -975,6 +874,221 @@ mzscheme <<EOF
 ;; init script
 ;; "mzscheme <<EOF" is only used for highlighting.
 
+(define eval
+  (%proc (lst)
+    "call insert(self.stack, ['op_eval', lst])"))
+
+(define macro-eval
+  (%proc (lst)
+    "call insert(self.stack, ['op_macro_apply'])
+     call insert(self.stack, ['op_args', lst.cdr, self.NIL])
+     call insert(self.stack, ['op_eval', lst.car])"))
+
+(define call-with-current-continuation
+  (%proc (proc)
+    "let cont = self.mk_continuation()
+     call insert(self.stack, ['op_apply', proc, self.cons(cont, self.NIL)])"))
+
+(define load
+  (%proc (filename)
+    "let save = [self.inbuf, self.getchar, self.stack]
+     let _res = self.load(self.to_vimobj(filename), 1)
+     let [self.inbuf, self.getchar, self.stack] = save"))
+
+(define exit
+  (%proc args
+    "let exitcode = (args == self.NIL) ? self.NIL : args.car
+     call insert(self.stack, ['op_exit', exitcode])"))
+
+(define error
+  (%proc (msg . args)
+    "call insert(self.stack, ['op_error', self.cons(msg, args)])"))
+
+(define display
+  (%proc (obj)
+    "echo (obj.type == 'string') ? obj.val : self.to_str(obj)
+     let _res = self.Undefined"))
+
+(define printf
+  (%proc (fmt . args)
+    "unlet fmt args
+     let args = self.to_vimobj(_args)
+     echo (len(args) == 1) ? args[0] : call('printf', args)
+     let _res = self.Undefined"))
+
+(define format
+  (%proc (fmt . args)
+    "unlet fmt args
+     let args = self.to_vimobj(_args)
+     let str = (len(args) == 1) ? args[0] : call('printf', args)
+     let _res = self.to_lispobj(str)"))
+
+(define %type
+  (%proc (x)
+    "let _res = self.mk_string(x.type)"))
+
+(define :call
+  (%proc (func . args)
+    "unlet func args
+     let [func; args] = self.to_vimobj(_args)
+     let r = call(func, args)
+     let _res = self.to_lispobj(r)"))
+
+(define :execute
+  (%proc (expr)
+    "execute self.to_vimobj(expr)
+     let _res = self.Undefined"))
+
+(define :let
+  (%proc (name value)
+    "unlet name value
+     let [name, value] = self.to_vimobj(_args)
+     execute printf('let %s = value', name)
+     let _res = self.Undefined"))
+
+(define make-hash-table
+  (%proc ()
+    "let _res = self.mk_hash({})"))
+
+;; Dictionary is not boxed automatically.
+;; Box its value for each access for now.
+;; type check is lazy.
+(define hash-table-ref
+  (%proc (hash key)
+    "unlet hash key
+     let [hash, key] = self.to_vimobj(_args)
+     let Value = hash[key]
+     if type(Value) == type({}) && get(Value, 'type', '') == 'hash'
+       let _res = Value
+     else
+       let _res = self.to_lispobj(Value)
+     endif"))
+
+(define hash-table-put!
+  (%proc (hash key value)
+    "unlet hash key
+     let hash = self.to_vimobj(_args.car)
+     let key = self.to_vimobj(_args.cdr.car)
+     let hash[key] = value
+     let _res = self.Undefined"))
+
+(define cons
+  (%proc (car cdr)
+    "let _res = self.cons(car, cdr)"))
+
+(define car
+  (%proc (pair)
+    "let _res = pair.car"))
+
+(define cdr
+  (%proc (pair)
+    "let _res = pair.cdr"))
+
+(define set-car!
+  (%proc (pair value)
+    "let pair.car = value
+     let _res = self.Undefined"))
+
+(define set-cdr!
+  (%proc (pair value)
+    "let pair.cdr = value
+     let _res = self.Undefined"))
+
+(define (not value)
+  (if value #f #t))
+
+(define (%make-cmp op)
+  (%proc (lhs rhs . rest)
+    "unlet lhs rhs rest
+     let op = self.to_vimobj(_this.scope[0]['op'])
+     let [lhs, rhs; rest] = self.to_vimobj(_args)
+     let expr = 'lhs ' . op . ' rhs'
+     let _res = self.False
+     if eval(expr)
+       let _res = self.True
+       let lhs = rhs
+       for rhs in rest
+         if !eval(expr)
+           let _res = self.False
+           break
+         endif
+         let lhs = rhs
+       endfor
+     endif"))
+
+(define (%make-cmp-ins op)
+  (%proc (lhs rhs . rest)
+    "let op = self.to_vimobj(_this.scope[0]['op'])
+     let expr = 'lhs ' . op . ' rhs'
+     let _res = self.False
+     if eval(expr)
+       let _res = self.True
+       let lhs = rhs
+       while rest.type == 'pair'
+         let rhs = rest.car
+         let rest = rest.cdr
+         if !eval(expr)
+           let _res = self.False
+           break
+         endif
+         let lhs = rhs
+       endwhile
+     endif"))
+
+(define (%make-sum op value-for-unary)
+  (%proc (num . rest)
+    "unlet num rest
+     let op = self.to_vimobj(_this.scope[0]['op'])
+     let unary = self.to_vimobj(_this.scope[0]['value-for-unary'])
+     let [num; rest] = self.to_vimobj(_args)
+     if rest == []
+       let sum = unary
+     else
+       let sum = num
+       let num = remove(rest, 0)
+     endif
+     let expr = 'sum ' . op . ' num'
+     let sum = eval(expr)
+     for num in rest
+       let sum = eval(expr)
+     endfor
+     let _res = self.to_lispobj(sum)"))
+
+(define =   (%make-cmp "=="))
+(define ==  (%make-cmp "=="))
+(define !=  (%make-cmp "!="))
+(define >   (%make-cmp ">"))
+(define >=  (%make-cmp ">="))
+(define <   (%make-cmp "<"))
+(define <=  (%make-cmp "<="))
+(define =~  (%make-cmp "=~"))
+(define !~  (%make-cmp "!~"))
+(define =#  (%make-cmp "==#"))
+(define ==# (%make-cmp "==#"))
+(define !=# (%make-cmp "!=#"))
+(define >#  (%make-cmp ">#"))
+(define >=# (%make-cmp ">=#"))
+(define <#  (%make-cmp "<#"))
+(define <=# (%make-cmp "<=#"))
+(define =~# (%make-cmp "=~#"))
+(define !~# (%make-cmp "!~#"))
+(define =?  (%make-cmp "==?"))
+(define ==? (%make-cmp "==?"))
+(define !=? (%make-cmp "!=?"))
+(define >?  (%make-cmp ">?"))
+(define >=? (%make-cmp ">=?"))
+(define <?  (%make-cmp "<?"))
+(define <=? (%make-cmp "<=?"))
+(define =~? (%make-cmp "=~?"))
+(define !~? (%make-cmp "!~?"))
+(define is  (%make-cmp-ins "is"))
+(define isnot (%make-cmp-ins "isnot"))
+(define +   (%make-sum "+" 0))
+(define -   (%make-sum "-" 0))
+(define *   (%make-sum "*" 1))
+(define /   (%make-sum "/" 1))
+(define %   (%make-sum "%" 1))
+
 (define (procedure? x) (=~ (%type x) "procedure\\|closure"))
 (define (syntax? x)    (= (%type x) "syntax"))
 (define (macro? x)     (= (%type x) "macro"))
@@ -985,6 +1099,7 @@ mzscheme <<EOF
 (define (number? x)    (= (%type x) "number"))
 (define (string? x)    (= (%type x) "string"))
 (define (hash? x)      (= (%type x) "hash"))
+(define (undefined? x) (= (%type x) "undefined"))
 (define (list? x)      (if (pair? x) (list? (cdr x)) (null? x)))
 (define (zero? x)      (= x 0))
 (define (positive? x)  (> x 0))
@@ -1042,11 +1157,16 @@ mzscheme <<EOF
               ,@(cddr code))
             ,(cons (car code) (map cadr (cadr code))))))))
 
-(define (apply func . args)
-  (let loop ((p '()) (args args))
-    (if (null? (cdr args))
-        (eval `(,func ,@(append (reverse p) (car args))))
-        (loop (cons (car args) p) (cdr args)))))
+(define apply
+  (%proc (proc . args)
+    "if args != self.NIL && args.cdr != self.NIL
+       let p = args
+       while p.cdr.cdr.type == 'pair'
+         let p = p.cdr
+       endwhile
+       let p.cdr = p.cdr.car
+     endif
+     call insert(self.stack, ['op_apply', proc, args])"))
 
 (define (length lst)
   (let loop ((n 0) (p lst))
@@ -1063,12 +1183,9 @@ mzscheme <<EOF
         (cat (cdr p) q (cons (car p) r))))
   (cat '() lst '()))
 
-(define (reverse lst)
-  (define (loop lst p)
-    (if (pair? lst)
-        (loop (cdr lst) (cons (car lst) p))
-        p))
-  (loop lst '()))
+(define reverse
+  (%proc (lst)
+    "let _res = self.reverse(lst)"))
 
 (define when
   (macro code
@@ -1241,6 +1358,14 @@ mzscheme <<EOF
   (define n (call/cc (lambda (k) (set! cc k) 0)))
   (if (< n 10) (begin (printf "%d" n) (cc (+ n 1)))))
 
+(define (test4)
+  ;; displaying nested list
+  (define x '("x!"))
+  (define y (list "y!" #f "x!" x))
+  (set-cdr! x x)
+  (set-car! (cdr y) y)
+  (display y))
+
 (define (fact n)
   (if (<= n 1)
       1
@@ -1252,9 +1377,6 @@ mzscheme <<EOF
       (+ (fib (- n 1)) (fib (- n 2)))))
 
 (define (str->hex str)
-  (define format
-    (macro args
-      `(:call "printf" ,@args)))
   (define (str-len str) (:call "strlen" str))
   (define (str-ref str n) (:call "strpart" str n 1))
   (define (str-ref-hex str n)
