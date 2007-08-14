@@ -958,7 +958,7 @@ mzscheme <<EOF
     "unlet hash key
      let [hash, key] = self.to_vimobj(_args)
      let Value = hash[key]
-     if type(Value) == type({}) && get(Value, 'type', '') == 'hash'
+     if type(Value) == type({}) && has_key(Value, 'type')
        let _res = Value
      else
        let _res = self.to_lispobj(Value)
