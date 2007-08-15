@@ -1,7 +1,7 @@
 " mosalisp.vim - lisp interpreter
 " Maintainer:   Yukihiro Nakadaira <yukihiro.nakadaira@gmail.com>
 " License:      This file is placed in the public domain.
-" Last Change:  2007-08-14
+" Last Change:  2007-08-16
 "
 " Usage:
 "   :source mosalisp.vim
@@ -26,6 +26,10 @@
 "
 "   See mosalisp.init() function and trailing script for more
 "   information.
+"
+"
+" TODO:
+"   - error handling mechanism
 
 let s:sfile = expand("<sfile>:p")
 
@@ -390,13 +394,12 @@ endfunction
 function s:lib.op_eval(op)
   let code = a:op[1]
   if code.type == "symbol"
-    for env in self.scope
-      if has_key(env, code.val)
-        call add(self.stack[0], env[code.val])
-        return
-      endif
-    endfor
-    call self.error(printf("Unbounded Variable: %s", code.val))
+    let [env, val] = self.findscope(self.scope, code.val)
+    if env != {}
+      call add(self.stack[0], val)
+    else
+      call self.error(printf("Unbounded Variable: %s", code.val))
+    endif
   elseif code.type == "pair"
     call insert(self.stack, ["op_call", code, code.cdr])
     call insert(self.stack, ["op_eval", code.car])
@@ -476,12 +479,6 @@ function s:lib.op_macro_replace(op)
   call add(self.stack[0], code)
 endfunction
 
-function s:lib.op_macro_apply(op)
-  let lst = a:op[1]
-  let [macro, args] = [lst.car, lst.cdr]
-  call self[macro.val](macro, args)
-endfunction
-
 function s:lib.op_return(op)
   let self.scope = a:op[1]
   call add(self.stack[0], a:op[2])
@@ -494,14 +491,13 @@ endfunction
 
 function s:lib.op_set(op)
   let [name, value] = a:op[1:]
-  for env in self.scope
-    if has_key(env, name.val)
-      let env[name.val] = value
-      call add(self.stack[0], self.Undefined)
-      return
-    endif
-  endfor
-  call self.error(printf("Unbounded Variable: %s", name.val))
+  let [env, val] = self.findscope(self.scope, name.val)
+  if env != {}
+    let env[name.val] = value
+    call add(self.stack[0], self.Undefined)
+  else
+    call self.error(printf("Unbounded Variable: %s", name.val))
+  endif
 endfunction
 
 function s:lib.op_if(op)
@@ -556,6 +552,15 @@ endfunction
 
 function s:lib.define(name, obj)
   let self.scope[0][a:name] = a:obj
+endfunction
+
+function s:lib.findscope(scope, name)
+  for env in a:scope
+    if has_key(env, a:name)
+      return [env, env[a:name]]
+    endif
+  endfor
+  return [{}, {}]
 endfunction
 
 function s:lib.begin(code)
@@ -678,8 +683,8 @@ endfunction
 function s:lib.f_vim_function(this, args)
   " vim function wrapper
   let args = self.to_vimobj(a:args)
-  let res = call(a:this.func, args)
-  call add(self.stack[0], self.to_lispobj(res))
+  let VimObj = call(a:this.func, args)
+  call add(self.stack[0], self.to_lispobj(VimObj))
 endfunction
 
 function s:lib.to_str(obj)
@@ -878,11 +883,11 @@ mzscheme <<EOF
   (%proc (lst)
     "call insert(self.stack, ['op_eval', lst])"))
 
-(define macro-eval
+(define macroexpand-1
   (%proc (lst)
-    "call insert(self.stack, ['op_macro_apply'])
-     call insert(self.stack, ['op_args', lst.cdr, self.NIL])
-     call insert(self.stack, ['op_eval', lst.car])"))
+    "let [symbol, code] = [lst.car, lst.cdr]
+     let macro = self.findscope(self.scope, symbol.val)[1]
+     call insert(self.stack, ['op_apply', macro, code])"))
 
 (define call-with-current-continuation
   (%proc (proc)
@@ -931,8 +936,8 @@ mzscheme <<EOF
   (%proc (func . args)
     "unlet func args
      let [func; args] = self.to_vimobj(_args)
-     let r = call(func, args)
-     let _res = self.to_lispobj(r)"))
+     let VimObj = call(func, args)
+     let _res = self.to_lispobj(VimObj)"))
 
 (define :execute
   (%proc (expr)
@@ -942,8 +947,8 @@ mzscheme <<EOF
 (define :let
   (%proc (name value)
     "unlet name value
-     let [name, value] = self.to_vimobj(_args)
-     execute printf('let %s = value', name)
+     let [name, VimObj] = self.to_vimobj(_args)
+     execute printf('let %s = VimObj', name)
      let _res = self.Undefined"))
 
 (define make-hash-table
@@ -1000,7 +1005,7 @@ mzscheme <<EOF
 (define (%make-cmp op)
   (%proc (lhs rhs . rest)
     "unlet lhs rhs rest
-     let op = self.to_vimobj(_this.scope[0]['op'])
+     let op = self.to_vimobj(self.findscope(_this.scope, 'op')[1])
      let [lhs, rhs; rest] = self.to_vimobj(_args)
      let expr = 'lhs ' . op . ' rhs'
      let _res = self.False
@@ -1018,7 +1023,7 @@ mzscheme <<EOF
 
 (define (%make-cmp-ins op)
   (%proc (lhs rhs . rest)
-    "let op = self.to_vimobj(_this.scope[0]['op'])
+    "let op = self.to_vimobj(self.findscope(_this.scope, 'op')[1])
      let expr = 'lhs ' . op . ' rhs'
      let _res = self.False
      if eval(expr)
@@ -1038,8 +1043,8 @@ mzscheme <<EOF
 (define (%make-sum op value-for-unary)
   (%proc (num . rest)
     "unlet num rest
-     let op = self.to_vimobj(_this.scope[0]['op'])
-     let unary = self.to_vimobj(_this.scope[0]['value-for-unary'])
+     let op = self.to_vimobj(self.findscope(_this.scope, 'op')[1])
+     let unary = self.to_vimobj(self.findscope(_this.scope, 'value-for-unary')[1])
      let [num; rest] = self.to_vimobj(_args)
      if rest == []
        let sum = unary
@@ -1158,8 +1163,11 @@ mzscheme <<EOF
             ,(cons (car code) (map cadr (cadr code))))))))
 
 (define apply
-  (%proc (proc . args)
-    "if args != self.NIL && args.cdr != self.NIL
+  (%proc (proc arg1 . args)
+    "if args == self.NIL
+       let args = arg1
+     else
+       let args = _args.cdr
        let p = args
        while p.cdr.cdr.type == 'pair'
          let p = p.cdr
@@ -1168,20 +1176,35 @@ mzscheme <<EOF
      endif
      call insert(self.stack, ['op_apply', proc, args])"))
 
-(define (length lst)
-  (let loop ((n 0) (p lst))
-    (if (pair? p)
-        (loop (+ n 1) (cdr p))
-        n)))
+(define length
+  (%proc (lst)
+    "let i = 0
+     while lst.type == 'pair'
+       let i += 1
+       let lst = lst.cdr
+     endwhile
+     let _res = self.to_lispobj(i)"))
 
-(define (append . lst)
-  (define (cat p q r)
-    (if (null? p)
-        (if (null? q)
-            (reverse r)
-            (cat (car q) (cdr q) r))
-        (cat (cdr p) q (cons (car p) r))))
-  (cat '() lst '()))
+(define append
+  (%proc (arg1 . rest)
+    "let _res = copy(arg1)
+     let r = _res
+     while r.cdr != self.NIL
+       let r.cdr = copy(r.cdr)
+       let r = r.cdr
+     endwhile
+     if rest != self.NIL
+       while rest.cdr != self.NIL
+         let r.cdr = copy(rest.car)
+         let r = r.cdr
+         while r.cdr != self.NIL
+           let r.cdr = copy(r.cdr)
+           let r = r.cdr
+         endwhile
+         let rest = rest.cdr
+       endwhile
+       let r.cdr = rest.car
+     endif"))
 
 (define reverse
   (%proc (lst)
@@ -1217,15 +1240,23 @@ mzscheme <<EOF
 
 (define (list . x) x)
 
-(define (map proc list)
-    (if (pair? list)
-        (cons (proc (car list)) (map proc (cdr list)))
-        '()))
+(define (map proc arg1 . rest)
+  (define (map1 proc lst res)
+    (if (null? lst)
+      (reverse res)
+      (map1 proc (cdr lst) (cons (proc (car lst)) res))))
+  (define (loop args res)
+    (if (null? (car args))
+      (reverse res)
+      (loop (map1 cdr args '())
+            (cons (apply proc (map1 car args '())) res))))
+  (if (null? rest)
+    (map1 proc arg1 '()) ;; for efficiency
+    (loop (cons arg1 rest) '())))
 
-(define (for-each proc list)
-    (if (pair? list)
-        (begin (proc (car list)) (for-each proc (cdr list)))
-        #t ))
+(define (for-each proc arg1 . rest)
+  (apply map proc arg1 rest)
+  (if #f #f)) ;; return #<undefined>
 
 (define (list-tail x k)
     (if (zero? k)
